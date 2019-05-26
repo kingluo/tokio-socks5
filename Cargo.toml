@@ -1,0 +1,13 @@
+[package]
+name = "tokio-socks5"
+version = "0.1.0"
+authors = ["Jinhua Luo <home_king@163.com>"]
+edition = "2018"
+
+[dependencies]
+tokio = {git = "https://github.com/tokio-rs/tokio", features = ["async-await-preview"]}
+tokio-threadpool = {git = "https://github.com/tokio-rs/tokio"}
+byteorder = "1"
+
+[patch.'https://github.com/tokio-rs/tokio']
+tokio = { git = 'https://github.com/kingluo/tokio', branch = "kingluo-patch-1" }
