@@ -9,10 +9,12 @@ name = "tokio_socks5"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { git = "https://github.com/tokio-rs/tokio", features = ["async-await-preview"] }
-tokio-threadpool = { git = "https://github.com/tokio-rs/tokio" }
+tokio = "0.2.0-alpha.5"
+tokio-executor = "0.2.0-alpha.5"
 byteorder = "1"
+backtrace = "0.3"
+futures-preview = "=0.3.0-alpha.19"
 
-[patch.'https://github.com/tokio-rs/tokio']
-tokio = { git = 'https://github.com/kingluo/tokio', branch = "kingluo-patch-1" }
-tokio-threadpool = { git = 'https://github.com/kingluo/tokio', branch = "kingluo-patch-1" }
+[patch.crates-io]
+tokio = { git = 'https://github.com/kingluo/tokio', branch = "patch-split" }
+tokio-executor = { git = 'https://github.com/kingluo/tokio', branch = "patch-split" }

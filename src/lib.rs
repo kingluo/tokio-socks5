@@ -1,100 +1,70 @@
-#![feature(await_macro, async_await)]
-
 use byteorder::{BigEndian, ByteOrder};
 
 use std::io;
 use std::io::Result;
 use std::net::{IpAddr, Ipv4Addr};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::net::{SocketAddr, ToSocketAddrs};
 
-use tokio::async_wait;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
-use tokio_threadpool::blocking;
 
-pub trait Encoder {
-    fn encode(&mut self, buf: &[u8]) -> &[u8];
-    fn decode(&mut self, buf: &mut [u8], len: usize) -> Result<usize>;
-    fn clone(&self) -> Box<Encoder + Send + Sync>;
+use backtrace::Backtrace;
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio_executor::threadpool::blocking;
+
+pub trait Encoder: Send + Sync {
+    fn encode(&self, buf: &[u8]) -> &[u8];
+    fn decode(&self, buf: &mut [u8], len: usize) -> Result<usize>;
+    fn clone_box(&self) -> Box<dyn Encoder>;
 }
 
-struct MyTcpStream {
-    stream: Arc<Mutex<TcpStream>>,
-    encoder: Option<Box<Encoder + Send + Sync>>,
-}
-
-impl Read for MyTcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = self.stream.lock().unwrap().read(buf)?;
-        match self.encoder {
-            Some(ref mut encoder) => encoder.decode(buf, len),
-            None => Ok(len),
-        }
+impl Clone for Box<dyn Encoder> {
+    fn clone(&self) -> Box<dyn Encoder> {
+        self.clone_box()
     }
 }
 
-impl Write for MyTcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut buf2 = buf;
-        if let Some(ref mut encoder) = self.encoder {
-            buf2 = encoder.encode(buf);
-        }
-        self.stream.lock().unwrap().write(buf2)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+async fn read<'a, T: AsyncRead + Unpin>(
+    s: &'a mut T,
+    encoder: &Option<Box<dyn Encoder>>,
+    buf: &'a mut [u8],
+) -> Result<usize> {
+    let sz = s.read(buf).await?;
+    match encoder {
+        Some(ref e) => e.decode(buf, sz),
+        None => Ok(sz),
     }
 }
 
-impl AsyncRead for MyTcpStream {}
-
-impl AsyncWrite for MyTcpStream {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        self.stream.lock().unwrap().shutdown(Shutdown::Write)?;
-        Ok(().into())
-    }
+async fn write_all<'a, T: AsyncWrite + Unpin>(
+    s: &'a mut T,
+    encoder: &Option<Box<dyn Encoder>>,
+    buf: &'a [u8],
+) -> Result<()> {
+    let buf2 = match encoder {
+        Some(ref e) => e.encode(buf),
+        None => buf,
+    };
+    s.write_all(buf2).await?;
+    Ok(())
 }
 
-impl MyTcpStream {
-    fn clone(&mut self) -> MyTcpStream {
-        MyTcpStream {
-            stream: self.stream.clone(),
-            encoder: match self.encoder {
-                Some(ref mut encoder) => Some(encoder.clone()),
-                None => None,
-            },
-        }
-    }
-
-    fn new(stream: TcpStream) -> Self {
-        MyTcpStream {
-            stream: Arc::new(Mutex::new(stream)),
-            encoder: None,
-        }
-    }
-
-    fn with_encoder(stream: TcpStream, encoder: Option<Box<Encoder + Send + Sync>>) -> Self {
-        MyTcpStream {
-            stream: Arc::new(Mutex::new(stream)),
-            encoder: encoder,
-        }
-    }
-}
-
-async fn copy_stream<'a>(
-    stream1: &'a mut MyTcpStream,
-    stream2: &'a mut MyTcpStream,
+async fn copy<'a, T: AsyncRead + Unpin, U: AsyncWrite + Unpin>(
+    stream1: &'a mut T,
+    stream2: &'a mut U,
+    encoder: &Option<Box<dyn Encoder>>,
 ) -> io::Result<()> {
     let mut buf = [0; 1024];
     loop {
-        let len = async_wait!(stream1.read_async(&mut buf))?;
+        let len = read(stream1, encoder, &mut buf).await?;
         if len == 0 {
             println!("socket broken");
             break;
         }
-        async_wait!(stream2.write_all_async(&buf[..len]))?
+        write_all(stream2, encoder, &buf[..len]).await?
     }
     Ok(())
 }
@@ -104,11 +74,12 @@ struct ToSockAddrsFuture {
 }
 
 impl Future for ToSockAddrsFuture {
-    type Item = SocketAddr;
-    type Error = ();
+    type Output = io::Result<SocketAddr>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         blocking(|| {
+            let bt = Backtrace::new();
+            println!("{:?}", bt);
             println!(
                 "ToSockAddrsFuture thread id={:?}",
                 std::thread::current().id()
@@ -122,18 +93,18 @@ impl Future for ToSockAddrsFuture {
     }
 }
 
-async fn handle(mut stream: MyTcpStream) -> Result<()> {
+async fn handle(mut stream: TcpStream, encoder: Option<Box<dyn Encoder>>) -> Result<()> {
     let mut buf = [0; 1024];
 
-    let len = async_wait!(stream.read_async(&mut buf))?;
+    let len = read(&mut stream, &encoder, &mut buf).await?;
 
     if 1 + 1 + (buf[1] as usize) != len || buf[0] != b'\x05' {
         println!("invalid header");
         return Ok(());
     }
-    async_wait!(stream.write_all_async(b"\x05\x00"))?;
+    write_all(&mut stream, &encoder, b"\x05\x00").await?;
 
-    let len = async_wait!(stream.read_async(&mut buf))?;
+    let len = read(&mut stream, &encoder, &mut buf).await?;
     if len <= 4 {
         println!("invalid proto");
         return Ok(());
@@ -150,7 +121,12 @@ async fn handle(mut stream: MyTcpStream) -> Result<()> {
 
     if cmd != 1 {
         println!("Command not supported");
-        async_wait!(stream.write_all_async(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00"))?;
+        write_all(
+            &mut stream,
+            &encoder,
+            b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -180,78 +156,68 @@ async fn handle(mut stream: MyTcpStream) -> Result<()> {
                 std::thread::current().id()
             );
 
-            addr = async_wait!(ToSockAddrsFuture { addr: dst_addr }).unwrap();
+            addr = ToSockAddrsFuture { addr: dst_addr }.await.unwrap();
         }
         _ => {
             println!("Address type not supported, type={}", atyp);
-            async_wait!(stream.write_all_async(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00"))?;
+            write_all(
+                &mut stream,
+                &encoder,
+                b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00",
+            )
+            .await?;
             return Ok(());
         }
     }
 
     println!("incoming socket, request upstream: {:?}", addr);
-    let up_stream = match async_wait!(TcpStream::connect(&addr)) {
+    let up_stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
             println!("Upstream connect failed, {}", e);
-            async_wait!(stream.write_all_async(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00"))?;
+            write_all(
+                &mut stream,
+                &encoder,
+                b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00",
+            )
+            .await?;
             return Ok(());
         }
     };
 
-    async_wait!(stream.write_all_async(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"))?;
+    write_all(
+        &mut stream,
+        &encoder,
+        b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00",
+    )
+    .await?;
     println!("handle thread id={:?}", std::thread::current().id());
 
-    let mut stream2 = stream.clone();
-    let mut up_stream = MyTcpStream::new(up_stream);
-    let mut up_stream2 = up_stream.clone();
-    tokio::spawn_async(async move {
-        println!("upstream: copy thread id={:?}", std::thread::current().id());
-        if let Err(err) = async_wait!(copy_stream(&mut up_stream2, &mut stream2)) {
-            println!("{}", err);
-        }
-        let _ = up_stream2.shutdown();
-        let _ = stream2.shutdown();
-        println!(
-            "upstream: exit copy thread id={:?}",
-            std::thread::current().id()
-        );
+    let (mut ri, mut wi) = stream.split();
+    let (mut ro, mut wo) = up_stream.split();
+
+    let encoder1 = encoder.as_ref().map(|e| e.clone());
+    tokio::spawn(async move {
+        copy(&mut ri, &mut wo, &encoder1).await.unwrap();
     });
-    tokio::spawn_async(async move {
-        println!(
-            "downstream: copy thread id={:?}",
-            std::thread::current().id()
-        );
-        if let Err(err) = async_wait!(copy_stream(&mut stream, &mut up_stream)) {
-            println!("{}", err);
-        }
-        let _ = stream.shutdown();
-        let _ = up_stream.shutdown();
-        println!(
-            "downstream: exit copy thread id={:?}",
-            std::thread::current().id()
-        );
+
+    let encoder2 = encoder.as_ref().map(|e| e.clone());
+    tokio::spawn(async move {
+        copy(&mut ro, &mut wi, &encoder2).await.unwrap();
     });
 
     return Ok(());
 }
 
-pub async fn run_socks5(addr: SocketAddr, encoder: Option<Box<Encoder + Send + Sync>>) {
-    let listener = TcpListener::bind(&addr).unwrap();
+pub async fn run_socks5(addr: SocketAddr, encoder: Option<Box<dyn Encoder>>) -> Result<()> {
+    let mut listener = TcpListener::bind(&addr).await?;
     println!("Listening on: {}", addr);
-    let mut incoming = listener.incoming();
 
-    while let Some(stream) = async_wait!(incoming.next()) {
-        let stream = stream.unwrap();
-        let encoder = match encoder {
-            Some(ref tmp) => Some(tmp.as_ref().clone()),
-            None => None,
-        };
-        let stream2 = MyTcpStream::with_encoder(stream, encoder);
-        tokio::spawn_async(async move {
-            if let Err(err) = async_wait!(handle(stream2)) {
-                println!("{}", err);
-            }
-        })
+    loop {
+        let encoder2 = encoder.as_ref().map(|e| e.clone());
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            handle(stream, encoder2).await.unwrap();
+        });
     }
 }

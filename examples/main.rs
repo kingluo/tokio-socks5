@@ -1,5 +1,3 @@
-#![feature(await_macro, async_await)]
-
 use std::env;
 use std::net::SocketAddr;
 use tokio_socks5::run_socks5;
@@ -11,6 +9,6 @@ fn main() {
         .parse::<SocketAddr>()
         .unwrap();
 
-    let mut rt = tokio::runtime::Builder::new().build().unwrap();
-    rt.block_on_async(run_socks5(addr, None));
+    let rt = tokio::runtime::Builder::new().build().unwrap();
+    rt.block_on(run_socks5(addr, None)).unwrap();
 }
