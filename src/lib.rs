@@ -4,20 +4,16 @@ use std::io;
 use std::io::Result;
 use std::net::{IpAddr, Ipv4Addr};
 use std::net::{SocketAddr, ToSocketAddrs};
-
-use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
-
-use backtrace::Backtrace;
-
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use tokio::net::{TcpListener, TcpStream};
+use tokio::prelude::*;
 use tokio_executor::threadpool::blocking;
 
 pub trait Encoder: Send + Sync {
-    fn encode(&self, buf: &[u8]) -> &[u8];
-    fn decode(&self, buf: &mut [u8], len: usize) -> Result<usize>;
+    fn encode(&mut self, buf: &[u8]) -> &[u8];
+    fn decode(&mut self, buf: &mut [u8], len: usize) -> Result<usize>;
     fn clone_box(&self) -> Box<dyn Encoder>;
 }
 
@@ -29,23 +25,35 @@ impl Clone for Box<dyn Encoder> {
 
 async fn read<'a, T: AsyncRead + Unpin>(
     s: &'a mut T,
-    encoder: &Option<Box<dyn Encoder>>,
+    encoder: &mut Option<Box<dyn Encoder>>,
     buf: &'a mut [u8],
 ) -> Result<usize> {
-    let sz = s.read(buf).await?;
-    match encoder {
-        Some(ref e) => e.decode(buf, sz),
-        None => Ok(sz),
+    loop {
+        let sz = s.read(buf).await?;
+
+        if sz == 0 {
+            return Ok(sz);
+        }
+        match encoder {
+            Some(ref mut e) => {
+                let res = e.decode(buf, sz);
+                match res {
+                    Ok(sz2) if sz2 == 0 => continue,
+                    _ => return res,
+                }
+            }
+            None => return Ok(sz),
+        }
     }
 }
 
 async fn write_all<'a, T: AsyncWrite + Unpin>(
     s: &'a mut T,
-    encoder: &Option<Box<dyn Encoder>>,
+    encoder: &mut Option<Box<dyn Encoder>>,
     buf: &'a [u8],
 ) -> Result<()> {
     let buf2 = match encoder {
-        Some(ref e) => e.encode(buf),
+        Some(ref mut e) => e.encode(buf),
         None => buf,
     };
     s.write_all(buf2).await?;
@@ -55,16 +63,17 @@ async fn write_all<'a, T: AsyncWrite + Unpin>(
 async fn copy<'a, T: AsyncRead + Unpin, U: AsyncWrite + Unpin>(
     stream1: &'a mut T,
     stream2: &'a mut U,
-    encoder: &Option<Box<dyn Encoder>>,
+    encoder1: &mut Option<Box<dyn Encoder>>,
+    encoder2: &mut Option<Box<dyn Encoder>>,
 ) -> io::Result<()> {
     let mut buf = [0; 1024];
     loop {
-        let len = read(stream1, encoder, &mut buf).await?;
+        let len = read(stream1, encoder1, &mut buf).await?;
         if len == 0 {
             println!("socket broken");
             break;
         }
-        write_all(stream2, encoder, &buf[..len]).await?
+        write_all(stream2, encoder2, &buf[..len]).await?
     }
     Ok(())
 }
@@ -78,13 +87,6 @@ impl Future for ToSockAddrsFuture {
 
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         blocking(|| {
-            let bt = Backtrace::new();
-            println!("{:?}", bt);
-            println!(
-                "ToSockAddrsFuture thread id={:?}",
-                std::thread::current().id()
-            );
-
             println!("resolving {}", self.addr);
             let mut addrs_iter = self.addr.to_socket_addrs().unwrap();
             addrs_iter.next().unwrap()
@@ -93,18 +95,18 @@ impl Future for ToSockAddrsFuture {
     }
 }
 
-async fn handle(mut stream: TcpStream, encoder: Option<Box<dyn Encoder>>) -> Result<()> {
+async fn handle(mut stream: TcpStream, mut encoder: Option<Box<dyn Encoder>>) -> Result<()> {
     let mut buf = [0; 1024];
 
-    let len = read(&mut stream, &encoder, &mut buf).await?;
+    let len = read(&mut stream, &mut encoder, &mut buf).await?;
 
     if 1 + 1 + (buf[1] as usize) != len || buf[0] != b'\x05' {
         println!("invalid header");
         return Ok(());
     }
-    write_all(&mut stream, &encoder, b"\x05\x00").await?;
+    write_all(&mut stream, &mut encoder, b"\x05\x00").await?;
 
-    let len = read(&mut stream, &encoder, &mut buf).await?;
+    let len = read(&mut stream, &mut encoder, &mut buf).await?;
     if len <= 4 {
         println!("invalid proto");
         return Ok(());
@@ -123,7 +125,7 @@ async fn handle(mut stream: TcpStream, encoder: Option<Box<dyn Encoder>>) -> Res
         println!("Command not supported");
         write_all(
             &mut stream,
-            &encoder,
+            &mut encoder,
             b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00",
         )
         .await?;
@@ -151,18 +153,13 @@ async fn handle(mut stream: TcpStream, encoder: Option<Box<dyn Encoder>>) -> Res
             let mut dst_addr = std::str::from_utf8(&buf[5..offset]).unwrap().to_string();
             dst_addr.push_str(":");
             dst_addr.push_str(&dst_port.to_string());
-            println!(
-                "before ToSockAddrsFuture thread id={:?}",
-                std::thread::current().id()
-            );
-
             addr = ToSockAddrsFuture { addr: dst_addr }.await.unwrap();
         }
         _ => {
             println!("Address type not supported, type={}", atyp);
             write_all(
                 &mut stream,
-                &encoder,
+                &mut encoder,
                 b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00",
             )
             .await?;
@@ -177,7 +174,7 @@ async fn handle(mut stream: TcpStream, encoder: Option<Box<dyn Encoder>>) -> Res
             println!("Upstream connect failed, {}", e);
             write_all(
                 &mut stream,
-                &encoder,
+                &mut encoder,
                 b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00",
             )
             .await?;
@@ -187,24 +184,27 @@ async fn handle(mut stream: TcpStream, encoder: Option<Box<dyn Encoder>>) -> Res
 
     write_all(
         &mut stream,
-        &encoder,
+        &mut encoder,
         b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00",
     )
     .await?;
-    println!("handle thread id={:?}", std::thread::current().id());
 
     let (mut ri, mut wi) = stream.split();
     let (mut ro, mut wo) = up_stream.split();
 
-    let encoder1 = encoder.as_ref().map(|e| e.clone());
+    let mut encoder1 = encoder.as_ref().map(|e| e.clone());
+    let mut encoder3 = None;
     tokio::spawn(async move {
-        copy(&mut ri, &mut wo, &encoder1).await.unwrap();
+        copy(&mut ri, &mut wo, &mut encoder1, &mut encoder3)
+            .await
+            .unwrap();
     });
 
-    let encoder2 = encoder.as_ref().map(|e| e.clone());
-    tokio::spawn(async move {
-        copy(&mut ro, &mut wi, &encoder2).await.unwrap();
-    });
+    let mut encoder2 = None;
+    let mut encoder4 = encoder.as_ref().map(|e| e.clone());
+    copy(&mut ro, &mut wi, &mut encoder2, &mut encoder4)
+        .await
+        .unwrap();
 
     return Ok(());
 }
