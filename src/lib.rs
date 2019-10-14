@@ -3,7 +3,7 @@ use byteorder::{BigEndian, ByteOrder};
 use std::io;
 use std::io::Result;
 use std::net::SocketAddr;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
@@ -133,6 +133,24 @@ async fn handle(mut stream: TcpStream, mut encoder: Option<Box<dyn Encoder>>) ->
             dst_addr.push_str(":");
             dst_addr.push_str(&dst_port.to_string());
             addr = dst_addr;
+        }
+        4 => {
+            if len != 22 {
+                println!("invalid proto");
+                return Ok(());
+            }
+            let dst_addr = IpAddr::V6(Ipv6Addr::new(
+                ((buf[4] as u16) << 8) | buf[5] as u16,
+                ((buf[6] as u16) << 8) | buf[7] as u16,
+                ((buf[8] as u16) << 8) | buf[9] as u16,
+                ((buf[10] as u16) << 8) | buf[11] as u16,
+                ((buf[12] as u16) << 8) | buf[13] as u16,
+                ((buf[14] as u16) << 8) | buf[15] as u16,
+                ((buf[16] as u16) << 8) | buf[17] as u16,
+                ((buf[18] as u16) << 8) | buf[19] as u16,
+            ));
+            let dst_port = BigEndian::read_u16(&buf[20..]);
+            addr = SocketAddr::new(dst_addr, dst_port).to_string();
         }
         _ => {
             println!("Address type not supported, type={}", atyp);
