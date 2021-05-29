@@ -11,3 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 byteorder = "1"
+log = "0.4.14"
+
+[dev-dependencies]
+pretty_env_logger = "0.4.0"

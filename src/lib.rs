@@ -7,19 +7,30 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-async fn copy<'a, T: AsyncRead + Unpin, U: AsyncWrite + Unpin>(
-    sk1: &'a mut T,
-    sk2: &'a mut U,
-) -> Result<()> {
+use log::*;
+
+async fn copy<'a, T: AsyncRead + Unpin, U: AsyncWrite + Unpin>(sk1: &'a mut T, sk2: &'a mut U) {
     let mut buf = [0; 1024];
     loop {
-        let len = sk1.read(&mut buf).await?;
+        let len = sk1.read(&mut buf[..]).await;
+        if let Err(err) = len {
+            error!("copy: read error: {:?}", err);
+            break;
+        }
+
+        let len = len.unwrap();
         if len == 0 {
             break;
         }
-        sk2.write_all(&buf[..len]).await?
+
+        match sk2.write_all(&buf[..len]).await {
+            Err(err) => {
+                error!("copy: write error: {:?}", err);
+                break;
+            }
+            _ => {}
+        }
     }
-    Ok(())
 }
 
 async fn handle(mut stream: TcpStream) -> Result<()> {
@@ -28,14 +39,14 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
     let len = stream.read(&mut buf).await?;
 
     if 1 + 1 + (buf[1] as usize) != len || buf[0] != b'\x05' {
-        eprintln!("invalid header");
+        error!("invalid header");
         return Ok(());
     }
     stream.write_all(b"\x05\x00").await?;
 
     let len = stream.read(&mut buf).await?;
     if len <= 4 {
-        eprintln!("invalid proto");
+        error!("invalid proto");
         return Ok(());
     }
 
@@ -44,12 +55,12 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
     let atyp = buf[3];
 
     if ver != b'\x05' {
-        eprintln!("invalid proto");
+        error!("invalid proto");
         return Ok(());
     }
 
     if cmd != 1 {
-        eprintln!("Command not supported");
+        error!("Command not supported");
         stream
             .write_all(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             .await?;
@@ -60,7 +71,7 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
     match atyp {
         1 => {
             if len != 10 {
-                eprintln!("invalid proto");
+                error!("invalid proto");
                 return Ok(());
             }
             let dst_addr = IpAddr::V4(Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]));
@@ -70,7 +81,7 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
         3 => {
             let offset = 4 + 1 + (buf[4] as usize);
             if offset + 2 != len {
-                eprintln!("invalid proto");
+                error!("invalid proto");
                 return Ok(());
             }
             let dst_port = BigEndian::read_u16(&buf[offset..]);
@@ -81,7 +92,7 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
         }
         4 => {
             if len != 22 {
-                eprintln!("invalid proto");
+                error!("invalid proto");
                 return Ok(());
             }
             let dst_addr = IpAddr::V6(Ipv6Addr::new(
@@ -98,7 +109,7 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
             addr = SocketAddr::new(dst_addr, dst_port).to_string();
         }
         _ => {
-            eprintln!("Address type not supported, type={}", atyp);
+            error!("Address type not supported, type={}", atyp);
             stream
                 .write_all(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
                 .await?;
@@ -106,11 +117,11 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
         }
     }
 
-    println!("incoming socket, request upstream: {:?}", addr);
+    info!("incoming socket, request upstream: {:?}", addr);
     let up_stream = match TcpStream::connect(addr).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Upstream connect failed, {}", e);
+            error!("Upstream connect failed, {}", e);
             stream
                 .write_all(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
                 .await?;
@@ -126,16 +137,16 @@ async fn handle(mut stream: TcpStream) -> Result<()> {
     let (mut ro, mut wo) = up_stream.into_split();
 
     tokio::spawn(async move {
-        copy(&mut ro, &mut wi).await.unwrap();
+        copy(&mut ro, &mut wi).await;
     });
 
-    copy(&mut ri, &mut wo).await.unwrap();
+    copy(&mut ri, &mut wo).await;
     return Ok(());
 }
 
 pub async fn run_socks5(addr: SocketAddr) -> Result<()> {
     let listener: TcpListener = TcpListener::bind(&addr).await?;
-    println!("Listening on: {}", addr);
+    info!("Listening on: {}", addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
