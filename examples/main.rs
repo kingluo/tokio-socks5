@@ -4,7 +4,7 @@ use tokio_socks5::run_socks5;
 
 #[tokio::main]
 async fn main() {
-    pretty_env_logger::init();
+    env_logger::init();
 
     let addr = env::args()
         .nth(1)
