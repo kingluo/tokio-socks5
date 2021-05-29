@@ -11,6 +11,3 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 byteorder = "1"
-aes = "0.7.3"
-ofb = "0.5.1"
-hex-literal = "0.3.1"
