@@ -9,10 +9,8 @@ name = "tokio_socks5"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = "0.2.0-alpha.5"
-tokio-executor = "0.2.0-alpha.5"
+tokio = { version = "1", features = ["full"] }
 byteorder = "1"
-futures-preview = "=0.3.0-alpha.19"
-
-[patch.crates-io]
-tokio = { git = 'https://github.com/kingluo/tokio', branch = "patch-split" }
+aes = "0.7.3"
+ofb = "0.5.1"
+hex-literal = "0.3.1"
